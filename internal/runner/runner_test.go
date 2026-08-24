@@ -57,3 +57,52 @@ func TestPermanentFailure(t *testing.T) {
 		t.Fatalf("attempts=%d", job.Attempts)
 	}
 }
+
+func TestRecoversQueuedAndRunningJobs(t *testing.T) {
+	store := NewMemoryStore()
+	now := time.Now().UTC()
+	for _, job := range []Job{
+		{ID: "queued-before-restart", Kind: "fetch", Status: Queued, CreatedAt: now, UpdatedAt: now},
+		{ID: "running-before-restart", Kind: "fetch", Status: Running, CreatedAt: now.Add(time.Millisecond), UpdatedAt: now},
+		{ID: "already-done", Kind: "fetch", Status: Succeeded, CreatedAt: now.Add(2 * time.Millisecond), UpdatedAt: now},
+	} {
+		if _, _, err := store.Create(context.Background(), job); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := NewWithStore(Config{Workers: 1}, func(context.Context, Job) error { return nil }, store)
+	if err := r.StartContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer r.Stop(context.Background())
+	wait(t, r, "queued-before-restart", Succeeded)
+	wait(t, r, "running-before-restart", Succeeded)
+	job, _ := r.Get("already-done")
+	if job.Attempts != 0 || job.Status != Succeeded {
+		t.Fatalf("completed job was replayed: %+v", job)
+	}
+}
+
+func TestCancelledJobCannotBecomeSucceeded(t *testing.T) {
+	started := make(chan struct{})
+	r := New(Config{Workers: 1}, func(ctx context.Context, _ Job) error {
+		close(started)
+		<-ctx.Done()
+		return nil
+	})
+	r.Start()
+	defer r.Stop(context.Background())
+	if _, err := r.Submit(Job{ID: "cancel-race", Kind: "fetch"}); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if !r.Cancel("cancel-race") {
+		t.Fatal("cancel returned false")
+	}
+	wait(t, r, "cancel-race", Cancelled)
+	time.Sleep(20 * time.Millisecond)
+	job, _ := r.Get("cancel-race")
+	if job.Status != Cancelled {
+		t.Fatalf("cancelled job changed status: %s", job.Status)
+	}
+}

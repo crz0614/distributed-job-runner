@@ -20,17 +20,20 @@ jobs:
           --health-retries 15
     env:
       PGPASSWORD: runner
+      TEST_DATABASE_URL: postgres://runner:runner@127.0.0.1:5432/runner?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: {go-version: '1.23'}
       - run: gofmt -w . && git diff --exit-code
+      - name: Apply PostgreSQL schema
+        run: |
+          psql -h 127.0.0.1 -U runner -d runner -v ON_ERROR_STOP=1 -f internal/runner/migrations/001_init.sql
       - run: go vet ./...
       - run: go test -race -cover ./...
       - run: go build ./cmd/server
       - name: Verify PostgreSQL schema
         run: |
-          psql -h 127.0.0.1 -U runner -d runner -v ON_ERROR_STOP=1 -f deploy/postgres/001_init.sql
           psql -h 127.0.0.1 -U runner -d runner -v ON_ERROR_STOP=1 <<'SQL'
           INSERT INTO jobs (id, kind, payload, status)
           VALUES ('ci-job', 'schema-check', '{"source":"ci"}', 'queued');

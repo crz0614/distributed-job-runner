@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
-	"github.com/crz0614/distributed-job-runner/internal/runner"
 	"log"
 	"net/http"
 	"os"
@@ -12,10 +12,13 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/crz0614/distributed-job-runner/internal/runner"
 )
 
 func main() {
-	r := runner.New(runner.Config{Workers: 6, QueueSize: 256, MaxAttempts: 3, AttemptTimeout: 5 * time.Second, Backoff: 150 * time.Millisecond}, func(ctx context.Context, j runner.Job) error {
+	cfg := runner.Config{Workers: 6, QueueSize: 256, MaxAttempts: 3, AttemptTimeout: 5 * time.Second, Backoff: 150 * time.Millisecond}
+	handler := func(ctx context.Context, j runner.Job) error {
 		select {
 		case <-time.After(250 * time.Millisecond):
 			if j.Payload["simulate"] == "failure" {
@@ -25,14 +28,50 @@ func main() {
 		case <-ctx.Done():
 			return ctx.Err()
 		}
-	})
-	r.Start()
+	}
+	var r *runner.Runner
+	var database *sql.DB
+	if databaseURL := os.Getenv("DATABASE_URL"); databaseURL != "" {
+		startupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		var err error
+		database, err = runner.OpenPostgres(startupCtx, databaseURL)
+		if err != nil {
+			log.Fatalf("database startup failed: %v", err)
+		}
+		defer database.Close()
+		if err := runner.MigratePostgres(startupCtx, database); err != nil {
+			log.Fatalf("database migration failed: %v", err)
+		}
+		r = runner.NewWithStore(cfg, handler, runner.NewPostgresStore(database))
+	} else {
+		log.Printf("DATABASE_URL is not set; using non-durable in-memory storage")
+		r = runner.New(cfg, handler)
+	}
+	if err := r.StartContext(context.Background()); err != nil {
+		log.Fatalf("runner startup failed: %v", err)
+	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		write(w, 200, map[string]any{"ok": true, "service": "distributed-job-runner"})
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, req *http.Request) {
+		storage := "memory"
+		if database != nil {
+			storage = "postgres"
+			if err := database.PingContext(req.Context()); err != nil {
+				write(w, 503, map[string]any{"ok": false, "service": "distributed-job-runner", "storage": storage})
+				return
+			}
+		}
+		write(w, 200, map[string]any{"ok": true, "service": "distributed-job-runner", "storage": storage})
 	})
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) { write(w, 200, r.Metrics()) })
-	mux.HandleFunc("GET /jobs", func(w http.ResponseWriter, _ *http.Request) { write(w, 200, r.List()) })
+	mux.HandleFunc("GET /jobs", func(w http.ResponseWriter, req *http.Request) {
+		jobs, err := r.ListContext(req.Context())
+		if err != nil {
+			write(w, 503, map[string]string{"error": "storage_unavailable"})
+			return
+		}
+		write(w, 200, jobs)
+	})
 	mux.HandleFunc("POST /jobs", func(w http.ResponseWriter, req *http.Request) {
 		var job runner.Job
 		if json.NewDecoder(http.MaxBytesReader(w, req.Body, 1<<20)).Decode(&job) != nil {
@@ -47,7 +86,11 @@ func main() {
 		write(w, 202, created)
 	})
 	mux.HandleFunc("GET /jobs/", func(w http.ResponseWriter, req *http.Request) {
-		job, ok := r.Get(strings.TrimPrefix(req.URL.Path, "/jobs/"))
+		job, ok, err := r.GetContext(req.Context(), strings.TrimPrefix(req.URL.Path, "/jobs/"))
+		if err != nil {
+			write(w, 503, map[string]string{"error": "storage_unavailable"})
+			return
+		}
 		if !ok {
 			write(w, 404, map[string]string{"error": "not_found"})
 			return
@@ -55,7 +98,12 @@ func main() {
 		write(w, 200, job)
 	})
 	mux.HandleFunc("DELETE /jobs/", func(w http.ResponseWriter, req *http.Request) {
-		if !r.Cancel(strings.TrimPrefix(req.URL.Path, "/jobs/")) {
+		cancelled, err := r.CancelContext(req.Context(), strings.TrimPrefix(req.URL.Path, "/jobs/"))
+		if err != nil {
+			write(w, 503, map[string]string{"error": "storage_unavailable"})
+			return
+		}
+		if !cancelled {
 			write(w, 409, map[string]string{"error": "not_cancellable"})
 			return
 		}

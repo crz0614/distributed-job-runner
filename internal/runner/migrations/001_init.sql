@@ -46,3 +46,4 @@ FOR EACH ROW
 EXECUTE FUNCTION set_jobs_updated_at();
 
 COMMIT;
+
