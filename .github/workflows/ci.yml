@@ -4,11 +4,54 @@ permissions: {contents: read}
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: runner
+          POSTGRES_USER: runner
+          POSTGRES_PASSWORD: runner
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U runner -d runner"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      PGPASSWORD: runner
+      TEST_DATABASE_URL: postgres://runner:runner@127.0.0.1:5432/runner?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: {go-version: '1.23'}
       - run: gofmt -w . && git diff --exit-code
+      - name: Apply PostgreSQL schema
+        run: |
+          psql -h 127.0.0.1 -U runner -d runner -v ON_ERROR_STOP=1 -f internal/runner/migrations/001_init.sql
       - run: go vet ./...
       - run: go test -race -cover ./...
       - run: go build ./cmd/server
+      - name: Verify PostgreSQL schema
+        run: |
+          psql -h 127.0.0.1 -U runner -d runner -v ON_ERROR_STOP=1 <<'SQL'
+          INSERT INTO jobs (id, kind, payload, status)
+          VALUES ('ci-job', 'schema-check', '{"source":"ci"}', 'queued');
+          INSERT INTO job_attempts (job_id, attempt)
+          VALUES ('ci-job', 1);
+          UPDATE jobs SET status = 'running', attempts = 1 WHERE id = 'ci-job';
+          DO $$
+          BEGIN
+            IF NOT EXISTS (
+              SELECT 1
+              FROM jobs
+              WHERE id = 'ci-job'
+                AND status = 'running'
+                AND attempts = 1
+                AND payload->>'source' = 'ci'
+            ) THEN
+              RAISE EXCEPTION 'job persistence assertion failed';
+            END IF;
+          END
+          $$;
+          SQL
