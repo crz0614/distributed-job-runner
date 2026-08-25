@@ -4,6 +4,7 @@ services:
     environment:
       DATABASE_URL: postgres://runner:runner@postgres:5432/runner?sslmode=disable
       API_TOKEN: ${API_TOKEN:?Set API_TOKEN in .env before starting the stack}
+      WRITE_RATE_LIMIT_PER_MINUTE: ${WRITE_RATE_LIMIT_PER_MINUTE:-60}
     ports:
       - "8080:8080"
     restart: unless-stopped
