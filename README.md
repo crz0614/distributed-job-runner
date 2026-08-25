@@ -15,8 +15,9 @@ Submit a job:
 
 ```bash
 curl -X POST http://localhost:8080/jobs \
-  -H 'content-type: application/json' \
-  -d '{"id":"demo-1","kind":"collect","payload":{"url":"https://example.com"}}'
+	-H 'content-type: application/json' \
+	-H "authorization: Bearer $API_TOKEN" \
+	-d '{"id":"demo-1","kind":"collect","payload":{"url":"https://example.com"}}'
 ```
 
 Use the same ID twice to observe idempotency. Set `payload.simulate` to `failure` to exercise retry and terminal failure behavior.
@@ -37,6 +38,8 @@ Use the same ID twice to observe idempotency. Set `payload.simulate` to `failure
 A versioned PostgreSQL schema now defines durable `jobs` and `job_attempts` records, status constraints, idempotent job IDs, attempt history, indexes and automatic `updated_at` maintenance.
 
 ```bash
+cp .env.example .env
+# Replace API_TOKEN in .env with a long random value.
 docker compose up --build
 curl http://localhost:8080/healthz
 ```
@@ -45,6 +48,8 @@ The Compose stack starts PostgreSQL 17, applies the versioned schema and gives t
 
 Without `DATABASE_URL`, the service deliberately falls back to an in-memory store for local evaluation and logs that the mode is non-durable. `/healthz` reports the active storage mode and returns `503` if PostgreSQL becomes unavailable.
 
+`POST /jobs` and `DELETE /jobs/{id}` require `Authorization: Bearer <API_TOKEN>`. Token hashes are compared in constant time. If `API_TOKEN` is missing, all mutating endpoints fail closed with `503` while read-only status and job inspection remain available. `/healthz` reports `writesEnabled` without exposing the credential.
+
 CI applies the migration to a real PostgreSQL service, runs the store integration tests, then verifies the Go race tests, vet and production build.
 
 ## 中文说明
@@ -52,6 +57,8 @@ CI applies the migration to a real PostgreSQL service, runs the store integratio
 这是一个纯 Go 高并发任务执行服务，展示工作池、队列背压、幂等提交、超时控制、自动重试、任务取消、优雅退出和指标监控。它适用于网页采集、API 集成、自动化任务及数据管道执行器。
 
 仓库已将 Go 运行时接入 PostgreSQL 17：任务、JSONB 载荷、状态变化及每次执行结果都会持久化；服务重启后会恢复排队中及意外中断的任务，不会重放已成功、失败或取消的终态任务。同一任务 ID 重复提交时返回原记录，避免重复执行。未配置 `DATABASE_URL` 时才会明确降级为仅供本地评估的内存模式。
+
+任务提交和取消接口必须提供 `API_TOKEN` Bearer Token，并使用恒定时间哈希比较。未配置令牌时写接口默认关闭，公开部署仍可安全展示只读状态；健康检查只报告写入功能是否启用，不会泄露凭据。
 
 ## Architecture
 
@@ -69,6 +76,7 @@ The Store boundary keeps the execution engine independent from persistence. Prod
 ## Safety
 
 - Request bodies are capped at 1 MiB.
+- Mutating endpoints fail closed and require a constant-time checked bearer token.
 - The queue is bounded and returns `queue full` instead of consuming unlimited memory.
 - Attempt deadlines prevent stuck upstream calls.
 - Shutdown is bounded by a context deadline.

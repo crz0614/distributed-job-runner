@@ -3,6 +3,7 @@ services:
     build: .
     environment:
       DATABASE_URL: postgres://runner:runner@postgres:5432/runner?sslmode=disable
+      API_TOKEN: ${API_TOKEN:?Set API_TOKEN in .env before starting the stack}
     ports:
       - "8080:8080"
     restart: unless-stopped
