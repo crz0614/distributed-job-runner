@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -15,6 +17,41 @@ import (
 
 	"github.com/crz0614/distributed-job-runner/internal/runner"
 )
+
+type APIAuth struct {
+	tokenHash [sha256.Size]byte
+	enabled   bool
+}
+
+func NewAPIAuth(token string) APIAuth {
+	if token == "" {
+		return APIAuth{}
+	}
+	return APIAuth{tokenHash: sha256.Sum256([]byte(token)), enabled: true}
+}
+
+func (a APIAuth) Protect(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		if !a.enabled {
+			write(w, http.StatusServiceUnavailable, map[string]string{"error": "writes_disabled"})
+			return
+		}
+		const prefix = "Bearer "
+		header := req.Header.Get("Authorization")
+		if !strings.HasPrefix(header, prefix) {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			write(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		candidate := sha256.Sum256([]byte(strings.TrimPrefix(header, prefix)))
+		if subtle.ConstantTimeCompare(candidate[:], a.tokenHash[:]) != 1 {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			write(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		next(w, req)
+	}
+}
 
 func main() {
 	cfg := runner.Config{Workers: 6, QueueSize: 256, MaxAttempts: 3, AttemptTimeout: 5 * time.Second, Backoff: 150 * time.Millisecond}
@@ -51,6 +88,10 @@ func main() {
 	if err := r.StartContext(context.Background()); err != nil {
 		log.Fatalf("runner startup failed: %v", err)
 	}
+	auth := NewAPIAuth(os.Getenv("API_TOKEN"))
+	if !auth.enabled {
+		log.Printf("API_TOKEN is not set; mutating endpoints are disabled")
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, req *http.Request) {
 		storage := "memory"
@@ -61,7 +102,7 @@ func main() {
 				return
 			}
 		}
-		write(w, 200, map[string]any{"ok": true, "service": "distributed-job-runner", "storage": storage})
+		write(w, 200, map[string]any{"ok": true, "service": "distributed-job-runner", "storage": storage, "writesEnabled": auth.enabled})
 	})
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) { write(w, 200, r.Metrics()) })
 	mux.HandleFunc("GET /jobs", func(w http.ResponseWriter, req *http.Request) {
@@ -72,7 +113,7 @@ func main() {
 		}
 		write(w, 200, jobs)
 	})
-	mux.HandleFunc("POST /jobs", func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("POST /jobs", auth.Protect(func(w http.ResponseWriter, req *http.Request) {
 		var job runner.Job
 		if json.NewDecoder(http.MaxBytesReader(w, req.Body, 1<<20)).Decode(&job) != nil {
 			write(w, 400, map[string]string{"error": "invalid_json"})
@@ -84,7 +125,7 @@ func main() {
 			return
 		}
 		write(w, 202, created)
-	})
+	}))
 	mux.HandleFunc("GET /jobs/", func(w http.ResponseWriter, req *http.Request) {
 		job, ok, err := r.GetContext(req.Context(), strings.TrimPrefix(req.URL.Path, "/jobs/"))
 		if err != nil {
@@ -97,7 +138,7 @@ func main() {
 		}
 		write(w, 200, job)
 	})
-	mux.HandleFunc("DELETE /jobs/", func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("DELETE /jobs/", auth.Protect(func(w http.ResponseWriter, req *http.Request) {
 		cancelled, err := r.CancelContext(req.Context(), strings.TrimPrefix(req.URL.Path, "/jobs/"))
 		if err != nil {
 			write(w, 503, map[string]string{"error": "storage_unavailable"})
@@ -108,7 +149,7 @@ func main() {
 			return
 		}
 		write(w, 202, map[string]bool{"cancelled": true})
-	})
+	}))
 	server := &http.Server{Addr: ":8080", Handler: requestLog(mux), ReadHeaderTimeout: 3 * time.Second}
 	go func() {
 		log.Printf("runner listening on %s", server.Addr)
