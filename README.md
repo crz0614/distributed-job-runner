@@ -51,6 +51,8 @@ Without `DATABASE_URL`, the service deliberately falls back to an in-memory stor
 
 `POST /jobs` and `DELETE /jobs/{id}` require `Authorization: Bearer <API_TOKEN>`. Token hashes are compared in constant time. If `API_TOKEN` is missing, all mutating endpoints fail closed with `503` while read-only status and job inspection remain available. `/healthz` reports `writesEnabled` without exposing the credential.
 
+Authenticated writes share a fixed-window limit configured by `WRITE_RATE_LIMIT_PER_MINUTE` (default `60`). Excess requests receive `429` with `Retry-After`; `/healthz` publishes the configured limit and `/metrics` counts rejected writes. Authentication runs first, so invalid credentials do not consume the trusted-client quota.
+
 `/metrics` emits the Prometheus text exposition format with queue depth and running-job gauges plus success, failure, retry and persistence-error counters. It can be scraped directly by Prometheus without an adapter; the endpoint contains no job payloads or credentials.
 
 CI applies the migration to a real PostgreSQL service, runs the store integration tests, then verifies the Go race tests, vet and production build.
@@ -62,6 +64,8 @@ CI applies the migration to a real PostgreSQL service, runs the store integratio
 仓库已将 Go 运行时接入 PostgreSQL 17：任务、JSONB 载荷、状态变化及每次执行结果都会持久化；服务重启后会恢复排队中及意外中断的任务，不会重放已成功、失败或取消的终态任务。同一任务 ID 重复提交时返回原记录，避免重复执行。未配置 `DATABASE_URL` 时才会明确降级为仅供本地评估的内存模式。
 
 任务提交和取消接口必须提供 `API_TOKEN` Bearer Token，并使用恒定时间哈希比较。未配置令牌时写接口默认关闭，公开部署仍可安全展示只读状态；健康检查只报告写入功能是否启用，不会泄露凭据。
+
+通过鉴权的写请求共享固定时间窗限流，可用 `WRITE_RATE_LIMIT_PER_MINUTE` 配置（默认每分钟 `60` 次）。超限返回带 `Retry-After` 的 `429`，健康检查公开当前限制，Prometheus 指标记录被拒绝的请求；无效凭据不会消耗可信客户端额度。
 
 `/metrics` 现在直接输出 Prometheus 标准文本格式，包括队列深度、运行中任务、成功、失败、重试和持久化错误指标，可直接接入监控抓取，不会暴露任务载荷或凭据。
 
@@ -82,6 +86,7 @@ The Store boundary keeps the execution engine independent from persistence. Prod
 
 - Request bodies are capped at 1 MiB.
 - Mutating endpoints fail closed and require a constant-time checked bearer token.
+- Authenticated writes are rate-limited and return a standards-friendly retry hint.
 - The queue is bounded and returns `queue full` instead of consuming unlimited memory.
 - Attempt deadlines prevent stuck upstream calls.
 - Shutdown is bounded by a context deadline.

@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,6 +23,68 @@ import (
 type APIAuth struct {
 	tokenHash [sha256.Size]byte
 	enabled   bool
+}
+
+type WriteRateLimiter struct {
+	mu          sync.Mutex
+	limit       int
+	window      time.Duration
+	windowStart time.Time
+	used        int
+	rejected    int64
+	now         func() time.Time
+}
+
+func NewWriteRateLimiter(limit int, window time.Duration) *WriteRateLimiter {
+	return &WriteRateLimiter{limit: limit, window: window, now: time.Now}
+}
+
+func (l *WriteRateLimiter) Protect(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		allowed, retryAfter := l.allow()
+		if !allowed {
+			w.Header().Set("Retry-After", strconv.Itoa(int((retryAfter+time.Second-1)/time.Second)))
+			write(w, http.StatusTooManyRequests, map[string]string{"error": "rate_limited"})
+			return
+		}
+		next(w, req)
+	}
+}
+
+func (l *WriteRateLimiter) allow() (bool, time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	if l.windowStart.IsZero() || now.Sub(l.windowStart) >= l.window {
+		l.windowStart = now
+		l.used = 0
+	}
+	if l.used >= l.limit {
+		l.rejected++
+		return false, l.window - now.Sub(l.windowStart)
+	}
+	l.used++
+	return true, 0
+}
+
+func (l *WriteRateLimiter) RejectedTotal() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.rejected
+}
+
+func writeRateLimit() int {
+	const defaultLimit = 60
+	raw := os.Getenv("WRITE_RATE_LIMIT_PER_MINUTE")
+	if raw == "" {
+		return defaultLimit
+	}
+	limit, err := strconv.Atoi(raw)
+	if err != nil || limit < 1 {
+		log.Printf("invalid WRITE_RATE_LIMIT_PER_MINUTE=%q; using %d", raw, defaultLimit)
+		return defaultLimit
+	}
+	return limit
 }
 
 func NewAPIAuth(token string) APIAuth {
@@ -90,6 +153,8 @@ func main() {
 		log.Fatalf("runner startup failed: %v", err)
 	}
 	auth := NewAPIAuth(os.Getenv("API_TOKEN"))
+	writeLimit := writeRateLimit()
+	limiter := NewWriteRateLimiter(writeLimit, time.Minute)
 	if !auth.enabled {
 		log.Printf("API_TOKEN is not set; mutating endpoints are disabled")
 	}
@@ -103,12 +168,12 @@ func main() {
 				return
 			}
 		}
-		write(w, 200, map[string]any{"ok": true, "service": "distributed-job-runner", "storage": storage, "writesEnabled": auth.enabled})
+		write(w, 200, map[string]any{"ok": true, "service": "distributed-job-runner", "storage": storage, "writesEnabled": auth.enabled, "writeRateLimitPerMinute": writeLimit})
 	})
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(prometheusMetrics(r.Metrics())))
+		_, _ = w.Write([]byte(prometheusMetrics(r.Metrics(), limiter.RejectedTotal())))
 	})
 	mux.HandleFunc("GET /jobs", func(w http.ResponseWriter, req *http.Request) {
 		jobs, err := r.ListContext(req.Context())
@@ -118,7 +183,7 @@ func main() {
 		}
 		write(w, 200, jobs)
 	})
-	mux.HandleFunc("POST /jobs", auth.Protect(func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("POST /jobs", auth.Protect(limiter.Protect(func(w http.ResponseWriter, req *http.Request) {
 		var job runner.Job
 		if json.NewDecoder(http.MaxBytesReader(w, req.Body, 1<<20)).Decode(&job) != nil {
 			write(w, 400, map[string]string{"error": "invalid_json"})
@@ -130,7 +195,7 @@ func main() {
 			return
 		}
 		write(w, 202, created)
-	}))
+	})))
 	mux.HandleFunc("GET /jobs/", func(w http.ResponseWriter, req *http.Request) {
 		job, ok, err := r.GetContext(req.Context(), strings.TrimPrefix(req.URL.Path, "/jobs/"))
 		if err != nil {
@@ -143,7 +208,7 @@ func main() {
 		}
 		write(w, 200, job)
 	})
-	mux.HandleFunc("DELETE /jobs/", auth.Protect(func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("DELETE /jobs/", auth.Protect(limiter.Protect(func(w http.ResponseWriter, req *http.Request) {
 		cancelled, err := r.CancelContext(req.Context(), strings.TrimPrefix(req.URL.Path, "/jobs/"))
 		if err != nil {
 			write(w, 503, map[string]string{"error": "storage_unavailable"})
@@ -154,7 +219,7 @@ func main() {
 			return
 		}
 		write(w, 202, map[string]bool{"cancelled": true})
-	}))
+	})))
 	server := &http.Server{Addr: ":8080", Handler: requestLog(mux), ReadHeaderTimeout: 3 * time.Second}
 	go func() {
 		log.Printf("runner listening on %s", server.Addr)
@@ -183,7 +248,7 @@ func requestLog(next http.Handler) http.Handler {
 	})
 }
 
-func prometheusMetrics(metrics runner.Metrics) string {
+func prometheusMetrics(metrics runner.Metrics, rateLimited int64) string {
 	values := []struct {
 		name       string
 		help       string
@@ -196,6 +261,7 @@ func prometheusMetrics(metrics runner.Metrics) string {
 		{"job_runner_failed_jobs_total", "Total number of failed job executions.", "counter", metrics.Failed},
 		{"job_runner_retries_total", "Total number of retried job attempts.", "counter", metrics.Retried},
 		{"job_runner_store_errors_total", "Total number of persistence errors.", "counter", metrics.StoreErrors},
+		{"job_runner_rate_limited_requests_total", "Total number of rejected mutating API requests.", "counter", rateLimited},
 	}
 	var output strings.Builder
 	for _, metric := range values {
