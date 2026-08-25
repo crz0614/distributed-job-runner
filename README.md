@@ -30,7 +30,7 @@ Use the same ID twice to observe idempotency. Set `payload.simulate` to `failure
 | `GET` | `/jobs` | List current jobs |
 | `GET` | `/jobs/{id}` | Inspect status and attempts |
 | `DELETE` | `/jobs/{id}` | Cancel queued/running work |
-| `GET` | `/metrics` | Queue and outcome counters |
+| `GET` | `/metrics` | Prometheus queue and outcome metrics |
 | `GET` | `/healthz` | Readiness probe |
 
 ## Durable PostgreSQL mode
@@ -42,6 +42,7 @@ cp .env.example .env
 # Replace API_TOKEN in .env with a long random value.
 docker compose up --build
 curl http://localhost:8080/healthz
+curl http://localhost:8080/metrics
 ```
 
 The Compose stack starts PostgreSQL 17, applies the versioned schema and gives the runner a `DATABASE_URL`. Jobs, JSONB payloads, status changes and per-attempt outcomes are persisted. On restart, queued jobs and jobs interrupted while running are recovered and executed again; terminal jobs are not replayed. Duplicate job IDs return the original record instead of creating duplicate work.
@@ -49,6 +50,8 @@ The Compose stack starts PostgreSQL 17, applies the versioned schema and gives t
 Without `DATABASE_URL`, the service deliberately falls back to an in-memory store for local evaluation and logs that the mode is non-durable. `/healthz` reports the active storage mode and returns `503` if PostgreSQL becomes unavailable.
 
 `POST /jobs` and `DELETE /jobs/{id}` require `Authorization: Bearer <API_TOKEN>`. Token hashes are compared in constant time. If `API_TOKEN` is missing, all mutating endpoints fail closed with `503` while read-only status and job inspection remain available. `/healthz` reports `writesEnabled` without exposing the credential.
+
+`/metrics` emits the Prometheus text exposition format with queue depth and running-job gauges plus success, failure, retry and persistence-error counters. It can be scraped directly by Prometheus without an adapter; the endpoint contains no job payloads or credentials.
 
 CI applies the migration to a real PostgreSQL service, runs the store integration tests, then verifies the Go race tests, vet and production build.
 
@@ -59,6 +62,8 @@ CI applies the migration to a real PostgreSQL service, runs the store integratio
 仓库已将 Go 运行时接入 PostgreSQL 17：任务、JSONB 载荷、状态变化及每次执行结果都会持久化；服务重启后会恢复排队中及意外中断的任务，不会重放已成功、失败或取消的终态任务。同一任务 ID 重复提交时返回原记录，避免重复执行。未配置 `DATABASE_URL` 时才会明确降级为仅供本地评估的内存模式。
 
 任务提交和取消接口必须提供 `API_TOKEN` Bearer Token，并使用恒定时间哈希比较。未配置令牌时写接口默认关闭，公开部署仍可安全展示只读状态；健康检查只报告写入功能是否启用，不会泄露凭据。
+
+`/metrics` 现在直接输出 Prometheus 标准文本格式，包括队列深度、运行中任务、成功、失败、重试和持久化错误指标，可直接接入监控抓取，不会暴露任务载荷或凭据。
 
 ## Architecture
 

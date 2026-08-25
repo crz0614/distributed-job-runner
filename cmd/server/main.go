@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -104,7 +105,11 @@ func main() {
 		}
 		write(w, 200, map[string]any{"ok": true, "service": "distributed-job-runner", "storage": storage, "writesEnabled": auth.enabled})
 	})
-	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) { write(w, 200, r.Metrics()) })
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(prometheusMetrics(r.Metrics())))
+	})
 	mux.HandleFunc("GET /jobs", func(w http.ResponseWriter, req *http.Request) {
 		jobs, err := r.ListContext(req.Context())
 		if err != nil {
@@ -176,4 +181,27 @@ func requestLog(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 		log.Printf("method=%s path=%s duration=%s", r.Method, r.URL.Path, time.Since(start))
 	})
+}
+
+func prometheusMetrics(metrics runner.Metrics) string {
+	values := []struct {
+		name       string
+		help       string
+		metricType string
+		value      int64
+	}{
+		{"job_runner_queued_jobs", "Current number of queued jobs.", "gauge", metrics.Queued},
+		{"job_runner_running_jobs", "Current number of running jobs.", "gauge", metrics.Running},
+		{"job_runner_succeeded_jobs_total", "Total number of successful job executions.", "counter", metrics.Succeeded},
+		{"job_runner_failed_jobs_total", "Total number of failed job executions.", "counter", metrics.Failed},
+		{"job_runner_retries_total", "Total number of retried job attempts.", "counter", metrics.Retried},
+		{"job_runner_store_errors_total", "Total number of persistence errors.", "counter", metrics.StoreErrors},
+	}
+	var output strings.Builder
+	for _, metric := range values {
+		output.WriteString("# HELP " + metric.name + " " + metric.help + "\n")
+		output.WriteString("# TYPE " + metric.name + " " + metric.metricType + "\n")
+		output.WriteString(metric.name + " " + strconv.FormatInt(metric.value, 10) + "\n")
+	}
+	return output.String()
 }
